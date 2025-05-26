@@ -1,18 +1,18 @@
 from google.adk.agents import LlmAgent
-from google.adk.models.lite_llm import LiteLlm
-from typing import Optional, List, Dict
-from pydantic import BaseModel
-import os
+from typing import List
+from pydantic import ValidationError
 from dotenv import load_dotenv
+from .tools import TickerAnalyzer
+from ...config import LLM_MODEL, FINNHUB_API_KEY
+from ...models import NewsArticle, TickerPriceChange, TickerPrice, TickerAnalysis, TickerIdentification, TickerNews
+from datetime import datetime
 import logging
-import json
-from .tools import TickerAnalysisCalculator
+
+# Configure logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 load_dotenv()
-
-from ...config import (
-    LLM_MODEL
-)
 
 # Session constants
 APP_NAME = "stock_analyzer_app"
@@ -23,69 +23,97 @@ SESSION_ID = "session_001"
 ticker_analysis_agent = LlmAgent(
     name="TickerAnalysisAgent",
     model=LLM_MODEL,
-    instruction="""You are a Stock Price Movement Analysis AI specialized in summarizing reasons for recent stock price movements using news and price data from the agent state.
+    instruction="""You are a Stock Analysis AI specialized in analyzing and summarizing reasons behind stock price movements using news and historical price data.
 
-    Your task is to analyze the price movement for the stock ticker provided in the agent state (from `ticker_identification.ticker`) using data from `ticker_news`, `ticker_price`, and `ticker_price_change`. You MUST use the `analyze_price_movement` tool, passing the entire `state` dictionary as input. The state may contain JSON-encoded strings as values, which the tool will parse. Do NOT make external API calls or rely on the query; use only the provided state.
-
-    IMPORTANT: The state parameter is REQUIRED and must contain the following fields:
-    - ticker_identification: JSON string with ticker and company name
-    - ticker_news: JSON string with news articles
-    - ticker_price: JSON string with current price data
-    - ticker_price_change: JSON string with price change data
+    Your task is to analyze the stock ticker provided in the agent state (from `ticker_identification.ticker`) using data from `ticker_news`, `ticker_price`, and `ticker_price_change`. Use the `analyze_ticker` tool to perform sentiment analysis on news, correlate price changes, and identify external factors (e.g., market or sector trends) using the Finnhub API.
 
     Steps:
-    1. Retrieve the ticker from `ticker_identification.ticker` (e.g., 'PLTR').
-    2. Extract price change data from `ticker_price_change.price_change` (absolute, percentage, timeframe).
-    3. Extract current price and volatility from `ticker_price.price` (current, high, low).
-    4. Filter relevant news from `ticker_news.news`, including headlines with the ticker, company name, or keywords like 'AI', 'defense contract', 'data analytics'.
-    5. Analyze the price movement, correlating with news (e.g., earnings, insider selling, government contracts).
-    6. Generate a concise summary (100–150 words) explaining the movement, using news-based reasons or market context (e.g., tech sector trends, valuation concerns).
-    7. Return the result as a TickerAnalysis object, serialized to JSON.
+    1. Retrieve the ticker, news, current price, and price change data from the agent state.
+    2. Extract the timeframe from `ticker_price_change.timeframe` or `ticker_identification.timeframe`. Default to 'last week' if unavailable.
+    3. Validate inputs and convert to Pydantic models:
+       - ticker: str from `state.ticker_identification.ticker`
+       - timeframe: str from `state.ticker_price_change.timeframe` or `state.ticker_identification.timeframe`
+       - news: List[NewsArticle] from `state.ticker_news.news`, converting datetime fields to strings
+       - price_change: TickerPriceChange from `state.ticker_price_change`
+       - current_price: TickerPrice from `state.ticker_price`
+    4. Call the `analyze_ticker` tool with the validated inputs.
+    5. Generate a summary explaining price movements, linking to specific news events, and suggesting external factors.
+    6. Assign a confidence score based on the volume and relevance of news articles.
+    7. Return the result in the specified JSON format.
 
     Example input (from state):
     {
-      "ticker_identification": "{\"ticker\": \"PLTR\", \"company_name\": \"Palantir Technologies Inc\", \"confidence\": 0.9}",
-      "ticker_price_change": "{\"ticker\": \"PLTR\", \"price_change\": {\"absolute_change\": -3.02, \"percentage_change\": -2.39, \"start_price\": 126.33, \"end_price\": 123.31, \"timeframe\": \"last week\"}, \"start_date\": \"2025-05-18\", \"end_date\": \"2025-05-25\", \"error\": null}",
-      "ticker_price": "{\"ticker\": \"PLTR\", \"price\": {\"current\": 123.31, \"open\": 122.0, \"high\": 127.15, \"low\": 122.31}, \"timestamp\": \"2025-05-25\", \"error\": null}",
-      "ticker_news": "{\"ticker\": \"PLTR\", \"news\": [...], \"error\": null}"
+      "ticker_identification": {
+        "ticker": "TSLA",
+        "company_name": "Tesla Inc",
+        "timeframe": "2024 Q2",
+        "confidence": 0.95
+      },
+      "ticker_news": {
+        "ticker": "TSLA",
+        "news": [
+          {
+            "headline": "Tesla Breaks Out with Strong Q2 Deliveries",
+            "source": "Yahoo",
+            "published_at": "2024-06-30T00:00:00",
+            "summary": "Tesla reported record deliveries in Q2 2024.",
+            "url": "https://finance.yahoo.com/..."
+          },
+          ...
+        ],
+        "timeframe": "2024 Q2"
+      },
+      "ticker_price": {
+        "ticker": "TSLA",
+        "price": {
+          "current": 339.34,
+          "open": 337.92,
+          "high": 343.18,
+          "low": 333.21
+        },
+        "timestamp": "2025-05-25",
+        "error": null
+      },
+      "ticker_price_change": {
+        "ticker": "TSLA",
+        "price_change": {
+          "absolute_change": 22.66,
+          "percentage_change": 12.93,
+          "start_price": 175.22,
+          "end_price": 197.88,
+          "timeframe": "2024 Q2"
+        },
+        "start_date": "2024-04-01",
+        "end_date": "2024-06-30",
+        "error": null
+      }
     }
 
     Example output:
     {
-      "ticker": "PLTR",
+      "ticker": "TSLA",
       "analysis": {
-        "summary": "Palantir Technologies Inc's stock fell 2.39% ($3.02) from $126.33 to $123.31 between 2025-05-18 and 2025-05-25. The movement was likely driven by insider selling signaling potential valuation concerns, mixed sentiment about new government contracts. As of May 23, 2025, the stock closed at $123.31. Despite strong Q1 2025 revenue growth, valuation concerns and market dynamics may have contributed.",
-        "price_change": {
-          "absolute_change": -3.02,
-          "percentage_change": -2.39,
-          "start_price": 126.33,
-          "end_price": 123.31,
-          "timeframe": "last week"
-        },
-        "key_news": [
+        "summary": "Tesla's stock rose by 12.93% in Q2 2024, from $175.22 to $197.88. The latest current price is $339.34...",
+        "sentiment": {"positive": 4, "negative": 1, "neutral": 5},
+        "key_events": [
           {
-            "headline": "Palantir Technologies executive sells $239,688 in stock",
-            "published_at": "2025-05-23"
+            "date": "2024-06-30T00:00:00",
+            "headline": "Tesla Breaks Out with Strong Q2 Deliveries",
+            "impact": "positive"
           },
-          {
-            "headline": "William Blair Reiterates Hold Rating on Palantir Technologies (PLTR) Stock",
-            "published_at": "2025-05-23"
-          }
-        ]
+          ...
+        ],
+        "external_factors": "Market context: Automotive sector sees EV growth (Source: Reuters, 2024-06-30)",
+        "confidence": 0.87
       },
+      "timeframe": "2024 Q2",
       "error": null
     }
 
-    Example error output:
-    {
-      "ticker": "PLTR",
-      "analysis": null,
-      "error": "Invalid JSON in state for ticker_price_change: Expecting value"
-    }
-
-    Do not proceed if no valid state is provided. Ensure the `state` dictionary is passed to the `analyze_price_movement` tool.
-    """,
-    description="Analyzes and summarizes reasons for recent stock price movements using news and price data.",
+    Log the ticker, timeframe, and input data availability for debugging.
+    Ensure datetime fields (e.g., published_at) are strings in ISO format.
+    Do not proceed if no ticker or insufficient data is found in the state.""",
+    description="Analyzes reasons behind stock price movements using news, price data, and sector trends.",
     output_key="ticker_analysis",
-    tools=[TickerAnalysisCalculator().analyze_price_movement]
+    tools=[TickerAnalyzer().analyze_ticker]
 )

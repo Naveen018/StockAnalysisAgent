@@ -4,12 +4,7 @@ import json
 import time
 from datetime import datetime, timedelta, UTC
 from requests.exceptions import JSONDecodeError as RequestsJSONDecodeError
-
-from ...config import (
-    POLYGON_API_KEY,
-    POLYGON_BASE_URL,
-    SUPPORTED_TIMEFRAMES,
-)
+from ...config import POLYGON_API_KEY, POLYGON_BASE_URL, SUPPORTED_TIMEFRAMES, QUARTER_PATTERN
 from ...models import PriceChange, TickerPriceChange
 
 # Configure logging
@@ -23,6 +18,78 @@ class TickerPriceChangeCalculator:
         self.api_key = POLYGON_API_KEY
         logger.info("TickerPriceChangeCalculator initialized with Polygon API key")
 
+    def _get_quarter_dates(self, timeframe: str, current_date: datetime) -> tuple[datetime, datetime]:
+        """Determine the start and end dates for the given timeframe or specific quarter."""
+        # Check if timeframe is a specific quarter (e.g., "2023 Q2")
+        quarter_match = QUARTER_PATTERN.match(timeframe)
+        if quarter_match:
+            year = int(quarter_match.group(1))
+            quarter = int(quarter_match.group(2))
+            if quarter == 1:
+                start_date = datetime(year, 1, 1, tzinfo=UTC)
+                end_date = datetime(year, 3, 31, tzinfo=UTC)
+            elif quarter == 2:
+                start_date = datetime(year, 4, 1, tzinfo=UTC)
+                end_date = datetime(year, 6, 30, tzinfo=UTC)
+            elif quarter == 3:
+                start_date = datetime(year, 7, 1, tzinfo=UTC)
+                end_date = datetime(year, 9, 30, tzinfo=UTC)
+            else:  # Q4
+                start_date = datetime(year, 10, 1, tzinfo=UTC)
+                end_date = datetime(year, 12, 31, tzinfo=UTC)
+            logger.info(f"Determined specific quarter Q{quarter} {year}: {start_date} to {end_date}")
+            return start_date, end_date
+
+        # Handle relative timeframes
+        now = current_date
+        if timeframe.lower() in ["today", "daily"]:
+            resolution = "day"
+            start_date = now - timedelta(days=1)
+            end_date = now
+        elif timeframe.lower() in ["last 2 days", "2 days"]:
+            resolution = "day"
+            start_date = now - timedelta(days=2)
+            end_date = now
+        elif timeframe.lower() in ["last 3 days", "3 days"]:
+            resolution = "day"
+            start_date = now - timedelta(days=3)
+            end_date = now
+        elif timeframe.lower() in ["last week", "weekly"]:
+            resolution = "day"
+            start_date = now - timedelta(days=7)
+            end_date = now
+        elif timeframe.lower() in ["last month", "monthly"]:
+            resolution = "day"
+            start_date = now - timedelta(days=30)
+            end_date = now
+        elif timeframe.lower() in ["last quarter", "quarterly"]:
+            resolution = "day"
+            current_month = now.month
+            current_year = now.year
+            if current_month >= 4:  # Q1 (Jan-Mar) complete
+                start_date = datetime(current_year, 1, 1, tzinfo=UTC)
+                end_date = datetime(current_year, 3, 31, tzinfo=UTC)
+            elif current_month >= 7:  # Q2 (Apr-Jun) complete
+                start_date = datetime(current_year, 4, 1, tzinfo=UTC)
+                end_date = datetime(current_year, 6, 30, tzinfo=UTC)
+            elif current_month >= 10:  # Q3 (Jul-Sep) complete
+                start_date = datetime(current_year, 7, 1, tzinfo=UTC)
+                end_date = datetime(current_year, 9, 30, tzinfo=UTC)
+            else:  # Q4 of previous year
+                start_date = datetime(current_year - 1, 10, 1, tzinfo=UTC)
+                end_date = datetime(current_year - 1, 12, 31, tzinfo=UTC)
+            logger.info(f"Determined last quarter: {start_date} to {end_date}")
+        elif timeframe.lower() in ["last 6 months", "6 months"]:
+            resolution = "week"
+            start_date = now - timedelta(days=180)
+            end_date = now
+        else:  # last year, annually
+            resolution = "week"
+            start_date = now - timedelta(days=365)
+            end_date = now
+
+        return start_date, end_date
+
     async def calculate_price_change(self, ticker: str, timeframe: str = "last week") -> TickerPriceChange:
         """Calculate stock price change for the given ticker and timeframe using Polygon.io API."""
         logger.info(f"calculate_price_change called with ticker: {ticker}, timeframe: {timeframe}")
@@ -34,23 +101,17 @@ class TickerPriceChangeCalculator:
                 error="No ticker provided"
             )
 
-        if timeframe.lower() not in SUPPORTED_TIMEFRAMES:
+        # Validate timeframe
+        if timeframe.lower() not in SUPPORTED_TIMEFRAMES and not QUARTER_PATTERN.match(timeframe):
             logger.warning(f"Unsupported timeframe: {timeframe}")
             return TickerPriceChange(
                 ticker=ticker,
-                error="Unsupported timeframe; use 'today' or 'last week'"
+                error="Unsupported timeframe; use 'today', 'last 2 days', 'last 3 days', 'last week', 'last month', 'last quarter', 'last 6 months', 'last year', 'annually', or 'YYYY QN' (e.g., '2023 Q2')"
             )
 
-        # Determine timeframe and set date range (UTC)
-        now = datetime.now(UTC)
-        if timeframe.lower() in ["today", "daily"]:
-            resolution = "day"
-            start_date = now - timedelta(days=1)
-            end_date = now
-        else:  # last week
-            resolution = "day"
-            start_date = now - timedelta(days=7)
-            end_date = now
+        # Determine timeframe and resolution
+        start_date, end_date = self._get_quarter_dates(timeframe, datetime.now(UTC))
+        resolution = "day" if QUARTER_PATTERN.match(timeframe) or timeframe.lower() in ["today", "daily", "last 2 days", "2 days", "last 3 days", "3 days", "last week", "weekly", "last month", "monthly", "last quarter", "quarterly"] else "week"
 
         # Format dates for Polygon API (YYYY-MM-DD)
         from_date = start_date.strftime("%Y-%m-%d")
@@ -134,7 +195,7 @@ class TickerPriceChangeCalculator:
 
                 # Extract price data
                 results = data["results"]
-                if len(results) < 2 and timeframe.lower() != "today":
+                if len(results) < 2 and timeframe.lower() not in ["today", "daily"]:
                     logger.warning(f"Insufficient data points for {ticker} on attempt {attempt}")
                     if attempt < max_retries:
                         logger.info("Retrying after 1-second delay")
@@ -147,12 +208,10 @@ class TickerPriceChangeCalculator:
                         error="Insufficient price data for the given timeframe"
                     )
 
-                if timeframe.lower() == "today":
-                    # Use open and close of the latest day
+                if timeframe.lower() in ["today", "daily"]:
                     open_price = results[-1]["o"] if results[-1].get("o") else 0
                     close_price = results[-1]["c"] if results[-1].get("c") else 0
                 else:
-                    # Use first and last close prices
                     open_price = results[0]["c"] if results[0].get("c") else 0
                     close_price = results[-1]["c"] if results[-1].get("c") else 0
 
@@ -210,4 +269,4 @@ class TickerPriceChangeCalculator:
                     start_date=start_date_str,
                     end_date=end_date_str,
                     error=f"Failed after {max_retries} attempts: {str(e)}"
-                ) 
+                )

@@ -1,4 +1,5 @@
 import os
+import re
 from dotenv import load_dotenv
 from google.adk.models.lite_llm import LiteLlm
 
@@ -26,4 +27,17 @@ POLYGON_BASE_URL = "https://api.polygon.io/v2"
 FINNHUB_BASE_URL = "https://finnhub.io/api/v1"
 
 # Timeframes
-SUPPORTED_TIMEFRAMES = ["today", "daily", "last week", "weekly", "week", "quarterly"] 
+SUPPORTED_TIMEFRAMES = [
+    "today", "daily",
+    "last 2 days", "2 days",
+    "last 3 days", "3 days",
+    "last week", "weekly",
+    "last month", "monthly",
+    "last quarter", "quarterly",
+    "last 6 months", "6 months",
+    "last year", "yearly",
+    "annually"
+]
+
+# Regular expression for specific year-quarter format (e.g., "2023 Q2")
+QUARTER_PATTERN = re.compile(r"^(20\d{2})\s*Q([1-4])$", re.IGNORECASE)
